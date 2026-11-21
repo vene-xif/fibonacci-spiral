@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Neon Fibonacci Spiral</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    overflow: hidden; background: #030409;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+  .hud {
+    position: fixed; left: 18px; top: 16px;
+    color: rgba(255, 255, 255, 0.62);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; letter-spacing: 0.22em;
+    pointer-events: none; user-select: none;
+  }
+  .hud h1 { font-size: 13px; font-weight: 600; letter-spacing: 0.34em; margin: 0 0 6px 0; color: rgba(255,255,255,0.82); }
+  .hud .sub { font-size: 11px; opacity: 0.7; letter-spacing: 0.12em; margin-bottom: 2px; }
+  .hud .big { font-size: 32px; letter-spacing: 0.06em; margin: 6px 0 0 0; font-weight: 500; transition: color 0.5s; }
+  .hud .phi { font-size: 11px; opacity: 0.55; letter-spacing: 0.10em; margin-top: 2px; }
+  .hint {
+    position: fixed; right: 18px; bottom: 14px;
+    color: rgba(255,255,255,0.34);
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 11px; letter-spacing: 0.14em;
+    pointer-events: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div class="hud">
+  <h1>FIBONACCI SPIRAL</h1>
+  <div class="sub">Quarter-circle arcs · radius = F<sub>i</sub></div>
+  <div class="big" id="radius">1</div>
+  <div class="phi">φ = (1 + √5) / 2 ≈ 1.6180339887</div>
+</div>
+<div class="hint">Click to pause</div>
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('stage');
+  var ctx = canvas.getContext('2d');
+  var radiusEl = document.getElementById('radius');
+
+  // ---------- Fibonacci tiling (tiling space: y grows downward) ----------
+  // Verified by derivation: squares placed on the long side of the box,
+  // with the placement normal cycling bottom/left/top/right (i>=2).
+  // Two unit squares at the inner region, spiral winds inward from the
+  // outermost square toward the pole (0, 0).
+  var ARCS = [
+    // [centerX, centerY, radius, startAngle, endAngle] — quarter arcs,
+    // swept counterclockwise (canvas angle decreasing) through square interior.
+    { cx: 1,  cy: 0,  r: 1,  a0: Math.PI,      a1: Math.PI / 2 },   // S0: (0,0)->(1,1)
+    { cx: 1,  cy: 0,  r: 1,  a0: Math.PI / 2,  a1: 0 },             // S1: (1,1)->(2,0)
+    { cx: 0,  cy: 0,  r: 2,  a0: 0,            a1: 3 * Math.PI / 2 }, // S2: (2,0)->(0,-2)
+    { cx: 0,  cy: 1,  r: 3,  a0: 3 * Math.PI / 2, a1: Math.PI },    // S3: (0,-2)->(-3,1)
+    { cx: 2,  cy: 1,  r: 5,  a0: Math.PI,      a1: Math.PI / 2 },   // S4: (-3,1)->(2,6)
+    { cx: 2,  cy: -2, r: 8,  a0: Math.PI / 2,  a1: 0 },             // S5: (2,6)->(10,-2)
+    { cx: -3, cy: -2, r: 13, a0: 0,            a1: 3 * Math.PI / 2 }, // S6: (10,-2)->(-3,-15)
+    { cx: -3, cy: 6,  r: 21, a0: 3 * Math.PI / 2, a1: Math.PI }     // S7: (-3,-15)->(-24,6)
+  ];
+
+  // Bounding box of the whole spiral in tiling space.
+  var BOX = { x0: -24, y0: -15, w: 34, h: 21 };
+
+  // Polyline of the spiral with cumulative arc length (tiling units).
+  var spiral = []; // {x, y, arcLen, radius, segIdx}
+  (function build() {
+    var cum = 0;
+    for (var i = 0; i < ARCS.length; i++) {
+      var a = ARCS[i];
+      var len = (Math.PI / 2) * a.r;
+      var steps = Math.max(14, Math.ceil(len * 6));
+      // All eight arcs sweep counterclockwise (canvas angle decreasing)
+      // through their square interiors — verified by construction.
+      var sweep = -Math.PI / 2;
+      for (var k = 0; k <= steps; k++) {
+        var t = k / steps;
+        var ang = a.a0 + sweep * t;
+        var x = a.cx + a.r * Math.cos(ang);
+        var y = a.cy + a.r * Math.sin(ang);
+        spiral.push({ x: x, y: y, arcLen: cum + len * t, radius: a.r, segIdx: i });
+      }
+      cum += len;
+    }
+  })();
+
+  var TOTAL_ARC = spiral.length ? spiral[spiral.length - 1].arcLen : 0;
+  var TOTAL_SAMPLES = spiral.length;
+
+  // ---------- Canvas / geometry ----------
+  var W = 0, H = 0, DPR = 1;
+  var scale = 1, ox = 0, oy = 0;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    var margin = Math.min(W, H) * 0.10;
+    scale = Math.min((W - 2 * margin) / BOX.w, (H - 2 * margin) / BOX.h);
+    ox = (W - BOX.w * scale) / 2 - BOX.x0 * scale;
+    oy = (H - BOX.h * scale) / 2 - BOX.y0 * scale;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function toCanvas(p) {
+    return { x: ox + p.x * scale, y: oy + p.y * scale };
+  }
+
+  // ---------- Dust particles ----------
+  var DUST_COUNT = 70;
+  var dust = [];
+  function makeDust() {
+    dust = [];
+    for (var i = 0; i < DUST_COUNT; i++) {
+      dust.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        r: 0.6 + Math.random() * 2.2,
+        vx: (Math.random() - 0.5) * 6,
+        vy: -2 - Math.random() * 6,
+        phase: Math.random() * Math.PI * 2,
+        twinkle: 0.5 + Math.random() * 0.5
+      });
+    }
+  }
+  makeDust();
+  window.addEventListener('resize', makeDust);
+
+  // ---------- Noise texture ----------
+  var noise = document.createElement('canvas');
+  noise.width = 160; noise.height = 160;
+  var noiseCtx = noise.getContext('2d');
+  function redrawNoise() {
+    var img = noiseCtx.createImageData(noise.width, noise.height);
+    for (var i = 0; i < img.data.length; i += 4) {
+      var v = Math.floor(Math.random() * 255);
+      img.data[i] = v; img.data[i + 1] = v; img.data[i + 2] = v; img.data[i + 3] = 255;
+    }
+    noiseCtx.putImageData(img, 0, 0);
+  }
+  redrawNoise();
+
+  // ---------- State ----------
+  var DURATION = 15000;            // ms to draw the full spiral
+  var state = {
+    phase: 'drawing',              // 'drawing' | 'holding' | 'fading'
+    startTime: performance.now(),
+    progress: 0,                   // arc-length progress (tiling units)
+    fade: 1,                       // global alpha (0..1)
+    hue: 320,                      // current base hue
+    targetHue: 320,                // random target
+    nextHueChange: 0,               // timestamp
+    paused: false,
+    holdStart: 0,
+    fadeStart: 0,
+    blink: 0
+  };
+
+  function pickNewHue(now) {
+    var palette = [186, 300, 160, 280, 30, 210, 340, 130]; // cyan, magenta, lime, violet, orange, blue, hot pink, green
+    state.targetHue = palette[(Math.random() * palette.length) | 0] + (Math.random() - 0.5) * 40;
+    state.nextHueChange = now + 2200 + Math.random() * 2600;
+  }
+  pickNewHue(performance.now());
+
+  radiusEl.textContent = '1';
+
+  // ---------- Helpers ----------
+  function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+  function drawParticles(now, tipHue, tipPos, dt) {
+    if (typeof dt === 'undefined') dt = 16.7;
+    for (var i = 0; i < dust.length; i++) {
+      var p = dust[i];
+      p.x += p.vx * dt / 1000;
+      p.y += p.vy * dt / 1000;
+      var tw = 0.5 + 0.5 * Math.sin(now / 700 + p.phase);
+      // wrap
+      if (p.y < -10) { p.y = H + 10; p.x = Math.random() * W; }
+      if (p.x < -10) p.x = W + 10;
+      if (p.x > W + 10) p.x = -10;
+      // Light influence: brighter near the pen tip
+      var dx = p.x - tipPos.x, dy = p.y - tipPos.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      var infl = Math.max(0, 1 - d / 420) * 0.85 + 0.15;
+      ctx.globalAlpha = tw * p.twinkle * 0.5 * infl * state.fade;
+      ctx.fillStyle = 'hsl(' + tipHue + ', 90%, 78%)';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawLight(tipPos, hue, now) {
+    // Volumetric spotlight from the pen tip
+    var r = Math.min(W, H) * 0.55;
+    var g = ctx.createRadialGradient(tipPos.x, tipPos.y, 0, tipPos.x, tipPos.y, r);
+    g.addColorStop(0, 'hsla(' + hue + ', 100%, 62%, 0.20)');
+    g.addColorStop(0.35, 'hsla(' + hue + ', 95%, 52%, 0.10)');
+    g.addColorStop(0.7, 'hsla(' + hue + ', 95%, 45%, 0.035)');
+    g.addColorStop(1, 'hsla(' + hue + ', 95%, 45%, 0)');
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    // Radial streaks
+    var rot = now * 0.00018;
+    for (var i = 0; i < 5; i++) {
+      var ang = (i / 5) * Math.PI * 2 + rot;
+      var x0 = tipPos.x + Math.cos(ang) * 24;
+      var y0 = tipPos.y + Math.sin(ang) * 24;
+      var x1 = tipPos.x + Math.cos(ang) * r * 0.72;
+      var y1 = tipPos.y + Math.sin(ang) * r * 0.72;
+      var gg = ctx.createLinearGradient(x0, y0, x1, y1);
+      gg.addColorStop(0, 'hsla(' + hue + ', 100%, 78%, 0.10)');
+      gg.addColorStop(1, 'hsla(' + hue + ', 100%, 78%, 0)');
+      ctx.strokeStyle = gg;
+      ctx.lineWidth = 3;
+      ctx.globalAlpha = 0.5 * state.fade;
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function drawBackground(now) {
+    // Deep background with a slow ambient radial glow
+    ctx.globalCompositeOperation = 'source-over';
+    var base = ctx.createRadialGradient(W * 0.5, H * 0.48, 0, W * 0.5, H * 0.48, Math.max(W, H) * 0.7);
+    base.addColorStop(0, '#0a0d18');
+    base.addColorStop(0.55, '#060810');
+    base.addColorStop(1, '#030409');
+    ctx.fillStyle = base;
+    ctx.fillRect(0, 0, W, H);
+
+    // Sparse faint grid — gives depth and a technical feel
+    ctx.strokeStyle = 'rgba(150, 170, 220, 0.035)';
+    ctx.lineWidth = 1;
+    var step = 56;
+    var off = (now / 38) % step;
+    ctx.beginPath();
+    for (var x = -step; x < W + step; x += step) {
+      ctx.moveTo(x + off, 0); ctx.lineTo(x + off, H);
+    }
+    for (var y = -step; y < H + step; y += step) {
+      ctx.moveTo(0, y); ctx.lineTo(W, y);
+    }
+    ctx.stroke();
+  }
+
+  function drawSpiral(now, progress) {
+    var baseHue = state.hue;
+    // Walk the spiral up to the pen position
+    var target = progress;
+    ctx.globalCompositeOperation = 'lighter';
+
+    // Layer 1: wide halo
+    ctx.globalAlpha = 0.085 * state.fade;
+    ctx.lineWidth = Math.max(2, 20 * scale * 0.02) + 14;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'hsl(' + (baseHue + 12) + ', 100%, 60%)';
+    ctx.beginPath();
+    var started = false;
+    for (var i = 0; i < spiral.length; i++) {
+      var p = spiral[i];
+      if (p.arcLen > target) break;
+      var c = toCanvas(p);
+      if (!started) { ctx.moveTo(c.x, c.y); started = true; }
+      else ctx.lineTo(c.x, c.y);
+    }
+    ctx.stroke();
+
+    // Layer 2: mid glow — per-segment hue gradient
+    for (var seg = 0; seg < ARCS.length; seg++) {
+      var segHue = baseHue + seg * 22;
+      ctx.strokeStyle = 'hsl(' + segHue + ', 100%, 63%)';
+      ctx.globalAlpha = 0.20 * state.fade;
+      ctx.lineWidth = Math.max(1.8, 6 * scale * 0.02) + 4.5;
+      ctx.beginPath();
+      started = false;
+      for (var i = 0; i < spiral.length; i++) {
+        var q = spiral[i];
+        if (q.segIdx !== seg) continue;
+        if (q.arcLen > target) break;
+        var cc = toCanvas(q);
+        if (!started) { ctx.moveTo(cc.x, cc.y); started = true; }
+        else ctx.lineTo(cc.x, cc.y);
+      }
+      ctx.stroke();
+    }
+
+    // Layer 3: bright core — source-over keeps saturated hues from blowing out
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 0.95 * state.fade;
+    ctx.lineWidth = Math.max(1.4, 2.6 * scale * 0.02) + 1.2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    // gradient along the spiral — segment-wise strokes
+    for (var seg2 = 0; seg2 < ARCS.length; seg2++) {
+      var segHue2 = baseHue + seg2 * 22;
+      ctx.strokeStyle = 'hsla(' + segHue2 + ', 100%, 74%, 1)';
+      ctx.beginPath();
+      started = false;
+      for (var i = 0; i < spiral.length; i++) {
+        var r = spiral[i];
+        if (r.segIdx !== seg2) continue;
+        if (r.arcLen > target) break;
+        var c2 = toCanvas(r);
+        if (!started) { ctx.moveTo(c2.x, c2.y); started = true; }
+        else ctx.lineTo(c2.x, c2.y);
+      }
+      ctx.stroke();
+    }
+
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function pointAt(progress) {
+    // binary search for the segment containing progress
+    var lo = 0, hi = spiral.length - 1;
+    if (progress <= spiral[0].arcLen) return { p: spiral[0], tip: toCanvas(spiral[0]), segIdx: spiral[0].segIdx, radius: spiral[0].radius };
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      if (spiral[mid].arcLen < progress) lo = mid + 1;
+      else hi = mid;
+    }
+    var a = spiral[Math.max(0, lo - 1)], b = spiral[lo];
+    var span = b.arcLen - a.arcLen;
+    var t = span > 0 ? (progress - a.arcLen) / span : 0;
+    var x = a.x + (b.x - a.x) * t;
+    var y = a.y + (b.y - a.y) * t;
+    var p = { x: x, y: y, segIdx: b.segIdx, radius: b.radius, arcLen: progress };
+    return { p: p, tip: toCanvas(p), segIdx: b.segIdx, radius: b.radius };
+  }
+
+  function drawPen(now, tip, progress, alpha) {
+    var baseHue = state.hue;
+    // Soft glow under the tip
+    ctx.globalCompositeOperation = 'lighter';
+    var r = 34;
+    var g = ctx.createRadialGradient(tip.x, tip.y, 0, tip.x, tip.y, r);
+    g.addColorStop(0, 'hsla(' + baseHue + ', 100%, 88%, 0.95)');
+    g.addColorStop(0.35, 'hsla(' + baseHue + ', 100%, 70%, 0.5)');
+    g.addColorStop(1, 'hsla(' + baseHue + ', 100%, 65%, 0)');
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(tip.x, tip.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    // White-hot core
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(tip.x, tip.y, 2.6 + Math.sin(now / 140) * 0.7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  function drawGrain(alpha) {
+    ctx.globalAlpha = alpha;
+    ctx.globalCompositeOperation = 'overlay';
+    ctx.drawImage(noise, 0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+  }
+
+  function drawVignette() {
+    var g = ctx.createRadialGradient(W * 0.5, H * 0.5, Math.min(W, H) * 0.32, W * 0.5, H * 0.5, Math.max(W, H) * 0.72);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(0,0,0,0.55)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function loop(now) {
+    window.__frames = (window.__frames || 0) + 1;
+    var last = loop._last || 0;
+    var dt = last ? Math.min(50, now - last) : 16.7;
+    loop._last = now;
+    // Ease the hue toward its target, pick a new target on the interval
+    if (now > state.nextHueChange) {
+      pickNewHue(now);
+    }
+    var dh = state.targetHue - state.hue;
+    // wrap to shortest path
+    if (dh > 180) dh -= 360;
+    if (dh < -180) dh += 360;
+    state.hue += dh * Math.min(1, 0.012 * (dt / 16.7));
+
+    // Phase state machine
+    if (!state.paused) {
+      if (state.phase === 'drawing') {
+        state.progress += (TOTAL_ARC / DURATION) * dt;
+        if (state.progress >= TOTAL_ARC) {
+          state.progress = TOTAL_ARC;
+          state.phase = 'holding';
+          state.holdStart = now;
+        }
+        // Ramp fade back in after a fade cycle
+        if (state.fade < 1 && now - state.startTime < 900) {
+          state.fade = Math.min(1, (now - state.startTime) / 900);
+        }
+      } else if (state.phase === 'holding') {
+        if (now - state.holdStart > 2600) {
+          state.phase = 'fading';
+          state.fadeStart = now;
+        }
+      } else if (state.phase === 'fading') {
+        var ft = (now - state.fadeStart) / 2000;
+        state.fade = Math.max(0, 1 - ft);
+        if (ft >= 1) {
+          state.phase = 'drawing';
+          state.startTime = now;
+          state.progress = 0;
+          state.fade = 0;
+        }
+      }
+    }
+
+    // Update HUD
+    var info = pointAt(state.progress);
+    var radiusNow = Math.round(info.radius);
+    if (radiusEl.textContent !== String(radiusNow)) radiusEl.textContent = String(radiusNow);
+
+    // ---- render ----
+    drawBackground(now);
+
+    var baseHue = state.hue;
+    var pulse = 0.94 + 0.06 * Math.sin(now / 620);
+    drawLight(info.tip, (baseHue + 12) % 360, now);
+    drawParticles(now, baseHue + 12, info.tip, dt);
+
+    ctx.save();
+    ctx.globalAlpha = state.fade * pulse;
+    drawSpiral(now, state.progress);
+    ctx.restore();
+
+    // Pen tip (while drawing, fades out during the hold)
+    var penAlpha = state.phase === 'drawing' ? state.fade
+      : state.phase === 'holding' ? Math.max(0, 1 - (now - state.holdStart) / 900)
+      : 0;
+    drawPen(now, info.tip, state.progress, Math.max(0, penAlpha));
+
+    drawGrain(0.035 * (0.6 + 0.4 * Math.sin(now * 0.001)));
+    drawVignette();
+
+    requestAnimationFrame(loop);
+  }
+
+  function scheduleNoise() {
+    redrawNoise();
+    setTimeout(scheduleNoise, 180);
+  }
+  scheduleNoise();
+
+  canvas.addEventListener('pointerdown', function () {
+    state.paused = !state.paused;
+    document.querySelector('.hint').textContent = state.paused ? 'Paused — click to resume' : 'Click to pause';
+  });
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
